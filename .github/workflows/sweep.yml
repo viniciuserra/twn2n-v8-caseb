@@ -1,0 +1,163 @@
+name: case-b sweep
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: case-b-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: "snr=${{ matrix.snr }}  N=${{ matrix.n_modes }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350      # ~5.8 h cap per matrix cell
+    strategy:
+      fail-fast: false
+      matrix:
+        snr: [5, 10, 15, 20, 25, 30, 35]
+        n_modes: [1, 2, 4, 6, 8, 16]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sweep slice  (case=b, snr=${{ matrix.snr }}, N=${{ matrix.n_modes }})
+        env:
+          # disable ntfy from inside matrix jobs (only the merge job pings)
+          NTFY_TOPIC: ""
+        run: |
+          python case1_twn2n_v8_anchor.py \
+            --cases b \
+            --snr-only ${{ matrix.snr }} \
+            --n-modes-only ${{ matrix.n_modes }} \
+            --restart
+
+      - name: Show slice summary
+        if: always()
+        run: |
+          if [ -f case1_v8_anchor_results/case1_v8_anchor_results.csv ]; then
+            echo "::group::CSV head"
+            head -n 1 case1_v8_anchor_results/case1_v8_anchor_results.csv
+            echo "::endgroup::"
+            echo "rows: $(wc -l < case1_v8_anchor_results/case1_v8_anchor_results.csv)"
+          else
+            echo "No CSV produced."
+          fi
+
+      - name: Upload slice CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-snr${{ matrix.snr }}-N${{ matrix.n_modes }}
+          path: case1_v8_anchor_results/case1_v8_anchor_results.csv
+          if-no-files-found: warn
+
+  merge:
+    name: merge slices
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl requests
+
+      - name: Download all slice artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge CSVs
+        run: |
+          python <<'PY'
+          import glob, json, os
+          from pathlib import Path
+          import pandas as pd
+          rows = []
+          paths = sorted(glob.glob('artifacts/*/case1_v8_anchor_results.csv'))
+          print(f'found {len(paths)} slice CSV(s):')
+          for p in paths:
+              print(' ', p)
+              df = pd.read_csv(p)
+              rows.append(df)
+          if not rows:
+              raise SystemExit('No slice CSVs to merge - all matrix cells failed?')
+          merged = pd.concat(rows, ignore_index=True)
+          merged.drop_duplicates(
+              subset=['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed'],
+              keep='last', inplace=True)
+          out = Path('case1_v8_anchor_caseb_merged.csv')
+          merged.to_csv(out, index=False)
+          print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
+          # Also write a small JSON summary for ntfy
+          summary = {
+              'n_slices': len(paths),
+              'rows': int(len(merged)),
+              'columns': int(len(merged.columns)),
+              'unique_cases': sorted(merged['case'].unique().tolist()),
+              'unique_snrs': sorted(int(x) for x in merged['snr_db'].unique()),
+              'unique_Ns': sorted(int(x) for x in merged['n_modes'].unique()),
+              'median_G_NMSE_dB': float(merged['G_NMSE_dB'].median()),
+              'mean_G_NMSE_dB': float(merged['G_NMSE_dB'].mean()),
+          }
+          Path('merge_summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload merged artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged
+          path: |
+            case1_v8_anchor_caseb_merged.csv
+            merge_summary.json
+
+      - name: ntfy on completion
+        if: always()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'vinicius-claude-alert' }}
+        run: |
+          python <<'PY'
+          import json, os, requests, sys
+          summary = {}
+          try:
+              summary = json.loads(open('merge_summary.json').read())
+          except Exception:
+              pass
+          topic = os.environ.get('NTFY_TOPIC') or 'vinicius-claude-alert'
+          status = 'DONE' if summary.get('rows') else 'FAILED'
+          msg = (f"GitHub Actions v8 case (b) sweep {status}: "
+                 f"{summary.get('rows', 0)} rows from {summary.get('n_slices', 0)} slices, "
+                 f"median G_NMSE_dB={summary.get('median_G_NMSE_dB', 'n/a')}")
+          try:
+              r = requests.post(f'https://ntfy.sh/{topic}',
+                                data=msg.encode('utf-8'),
+                                headers={'Title': 'TWN2N v8 case(b) — Actions DONE',
+                                         'Priority': 'high',
+                                         'Tags': 'white_check_mark' if status == 'DONE' else 'warning'},
+                                timeout=10)
+              print('ntfy:', r.status_code, msg)
+          except Exception as e:
+              print('ntfy failed:', e)
+          PY
