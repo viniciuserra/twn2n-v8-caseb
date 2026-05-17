@@ -553,14 +553,15 @@ def load_already_done(csv_path: Path) -> set[tuple]:
 
 
 def sweep_cells(cells: list[tuple], n_seeds: int,
-                already_done: set[tuple]) -> list[dict[str, Any]]:
+                already_done: set[tuple],
+                seed_start: int = 0) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     total = len(cells) * n_seeds
     done = 0
     skipped = 0
     t_start = time.time()
     for (case, snr, N, n_z, p) in cells:
-        for seed in range(n_seeds):
+        for seed in range(seed_start, seed_start + n_seeds):
             key = (str(case), float(snr), int(N), int(n_z), int(p), int(seed))
             if key in already_done:
                 done += 1
@@ -619,7 +620,13 @@ def _parse_csv_list(s, cast):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--seeds", type=int, default=1,
+                        help="Number of consecutive seeds to run starting at "
+                             "--seed-start (default 1 -> just one seed).")
+    parser.add_argument("--seed-start", type=int, default=0,
+                        help="First seed index to run (default 0). Combined "
+                             "with --seeds this runs seed-start..seed-start+seeds-1. "
+                             "Use --seeds 1 --seed-start N to pin a single seed.")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--cases", default=",".join(CASES),
                         help="Comma-separated subset of cases (a,b). "
@@ -691,7 +698,8 @@ def main() -> int:
 
     t_start = time.time()
     try:
-        rows = sweep_cells(cells, n_seeds, already_done)
+        rows = sweep_cells(cells, n_seeds, already_done,
+                           seed_start=args.seed_start)
     except KeyboardInterrupt:
         ntfy(message="v8 sweep interrupted by user.",
              title="TWN2N v8 — interrupted",
