@@ -1,18 +1,27 @@
-name: case-b sweep
+name: case sweep
 
 on:
   workflow_dispatch:
+    inputs:
+      case:
+        description: 'Which case to run (a or b)'
+        required: true
+        default: 'a'
+        type: choice
+        options:
+          - a
+          - b
 
 permissions:
   contents: read
 
 concurrency:
-  group: case-b-sweep
+  group: case-sweep-${{ github.event.inputs.case }}
   cancel-in-progress: false
 
 jobs:
   sweep:
-    name: "snr=${{ matrix.snr }}  N=${{ matrix.n_modes }}"
+    name: "case=${{ github.event.inputs.case }}  snr=${{ matrix.snr }}  N=${{ matrix.n_modes }}"
     runs-on: ubuntu-latest
     timeout-minutes: 350      # ~5.8 h cap per matrix cell
     strategy:
@@ -36,13 +45,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sweep slice  (case=b, snr=${{ matrix.snr }}, N=${{ matrix.n_modes }})
+      - name: Run sweep slice
         env:
-          # disable ntfy from inside matrix jobs (only the merge job pings)
           NTFY_TOPIC: ""
         run: |
           python case1_twn2n_v8_anchor.py \
-            --cases b \
+            --cases ${{ github.event.inputs.case }} \
             --snr-only ${{ matrix.snr }} \
             --n-modes-only ${{ matrix.n_modes }} \
             --restart
@@ -63,12 +71,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: csv-snr${{ matrix.snr }}-N${{ matrix.n_modes }}
+          name: csv-case${{ github.event.inputs.case }}-snr${{ matrix.snr }}-N${{ matrix.n_modes }}
           path: case1_v8_anchor_results/case1_v8_anchor_results.csv
           if-no-files-found: warn
 
   merge:
-    name: merge slices
+    name: merge slices (case=${{ github.event.inputs.case }})
     needs: sweep
     if: always()
     runs-on: ubuntu-latest
@@ -83,77 +91,81 @@ jobs:
       - name: Install dependencies
         run: pip install pandas openpyxl requests
 
-      - name: Download all slice artifacts
+      - name: Download all slice artifacts (this run, this case)
         uses: actions/download-artifact@v4
         with:
+          pattern: csv-case${{ github.event.inputs.case }}-*
           path: artifacts
 
       - name: Merge CSVs
+        env:
+          CASE: ${{ github.event.inputs.case }}
         run: |
           python <<'PY'
           import glob, json, os
           from pathlib import Path
           import pandas as pd
-          rows = []
+          case = os.environ['CASE']
           paths = sorted(glob.glob('artifacts/*/case1_v8_anchor_results.csv'))
-          print(f'found {len(paths)} slice CSV(s):')
+          print(f'found {len(paths)} slice CSV(s) for case={case}:')
+          rows = []
           for p in paths:
               print(' ', p)
-              df = pd.read_csv(p)
-              rows.append(df)
+              rows.append(pd.read_csv(p))
           if not rows:
-              raise SystemExit('No slice CSVs to merge - all matrix cells failed?')
+              raise SystemExit(f'No slice CSVs to merge for case={case}.')
           merged = pd.concat(rows, ignore_index=True)
           merged.drop_duplicates(
               subset=['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed'],
               keep='last', inplace=True)
-          out = Path('case1_v8_anchor_caseb_merged.csv')
+          out = Path(f'case1_v8_anchor_case{case}_merged.csv')
           merged.to_csv(out, index=False)
           print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
-          # Also write a small JSON summary for ntfy
           summary = {
+              'case': case,
               'n_slices': len(paths),
               'rows': int(len(merged)),
               'columns': int(len(merged.columns)),
-              'unique_cases': sorted(merged['case'].unique().tolist()),
               'unique_snrs': sorted(int(x) for x in merged['snr_db'].unique()),
               'unique_Ns': sorted(int(x) for x in merged['n_modes'].unique()),
               'median_G_NMSE_dB': float(merged['G_NMSE_dB'].median()),
               'mean_G_NMSE_dB': float(merged['G_NMSE_dB'].mean()),
           }
-          Path('merge_summary.json').write_text(json.dumps(summary, indent=2))
+          Path(f'merge_summary_case{case}.json').write_text(json.dumps(summary, indent=2))
           print(json.dumps(summary, indent=2))
           PY
 
-      - name: Upload merged artefact
+      - name: Upload merged artifact
         uses: actions/upload-artifact@v4
         with:
-          name: merged
+          name: merged-case${{ github.event.inputs.case }}
           path: |
-            case1_v8_anchor_caseb_merged.csv
-            merge_summary.json
+            case1_v8_anchor_case*_merged.csv
+            merge_summary_case*.json
 
       - name: ntfy on completion
         if: always()
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'vinicius-claude-alert' }}
+          CASE: ${{ github.event.inputs.case }}
         run: |
           python <<'PY'
-          import json, os, requests, sys
+          import json, os, requests
+          case = os.environ['CASE']
           summary = {}
           try:
-              summary = json.loads(open('merge_summary.json').read())
+              summary = json.loads(open(f'merge_summary_case{case}.json').read())
           except Exception:
               pass
           topic = os.environ.get('NTFY_TOPIC') or 'vinicius-claude-alert'
           status = 'DONE' if summary.get('rows') else 'FAILED'
-          msg = (f"GitHub Actions v8 case (b) sweep {status}: "
+          msg = (f"GitHub Actions v8 case ({case}) sweep {status}: "
                  f"{summary.get('rows', 0)} rows from {summary.get('n_slices', 0)} slices, "
                  f"median G_NMSE_dB={summary.get('median_G_NMSE_dB', 'n/a')}")
           try:
               r = requests.post(f'https://ntfy.sh/{topic}',
                                 data=msg.encode('utf-8'),
-                                headers={'Title': 'TWN2N v8 case(b) — Actions DONE',
+                                headers={'Title': f'TWN2N v8 case({case}) — Actions DONE',
                                          'Priority': 'high',
                                          'Tags': 'white_check_mark' if status == 'DONE' else 'warning'},
                                 timeout=10)
